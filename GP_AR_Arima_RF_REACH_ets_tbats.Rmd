@@ -1,0 +1,530 @@
+---
+title: "GP-Data : AutoRegression; ARIMA; Random Forest; REACH"
+output: html_notebook
+---
+In this notebook, I will conduct predictive forecasting in a time series of the daily Influenza Like Illness (ILI) counts. I will conduct a univariate time series analysis using Sentinel GP ILI counts (daily, from 2015).
+A novel REACH model is Run
+
+The analysis will compare 3 methods:
+1. Autoregression
+2. ARIMA time series forecasting
+3. ETS
+4. TBATS
+5. Random Forest
+6. Novel: REACH
+
+For all methods, the training set is data from years 2015-2017 and the test set is data from years 2018-2019
+
+Evaluation:
+1. RMSE
+2. MSE
+
+The following code will loadthe required packages for the analysis
+```{r install libraries}
+install.packages(c("mosaicData","dplyr","forecast","ggplot2","tidyr","imputeTS","xts","tsbox","Metrics","lubridate","prophet"))
+library(mosaicData)
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(tidyr)
+library(imputeTS)
+library(xts)                        
+library(tsbox)
+library(Metrics)
+library(lubridate)
+library(prophet)
+install.packages("data.table")
+library(data.table)
+```
+Read the Sentinel GP data, filter out the reported date and ILI counts and take a sum value of ILI Incicidences for each data to aggregate the data so that each row represents 1 day and the sum total of ILI cases for that day in the Auckland reagin (i.e. 3 DHBs - Waitemata; Counties Manukau and Auckland city)
+ILI surveillance is conducted each year from April - September each year, hence the data is recorded for those times of the year. 
+Create rows for those missing days.
+```{r}
+#new data
+# GP<-read.csv(file="~/Google Drive/My Drive/PhD/Data/gp_dhb_ili.csv",header=TRUE) 
+# 
+# GPfilter <- GP %>% select('ReportedDate','ILIIncidenceCount','DHBName')
+# # filter data for DHB's is the auckland region
+# GPfilter <- GPfilter %>% filter(DHBName %in% c("Counties Manukau","Auckland","Waitemata"))
+# 
+# GPfilter <- GPfilter %>% select('ReportedDate','ILIIncidenceCount') %>% 
+#   mutate(ReportedDate=as.Date(ReportedDate,"%d/%m/%Y"),ILIIncidenceCount=as.numeric(ILIIncidenceCount))
+# 
+# finalGP <- GPfilter %>% group_by(ReportedDate) %>% summarise(ILIIncidenceCount=sum(ILIIncidenceCount))
+# 
+# cat("Number of rows in the final aggregated dataset = ", nrow(finalGP))
+
+GP<-read.csv(file="~/Google Drive/My Drive/PhD/Data/ILI_data_06_03_2019.csv",sep="\t",header=TRUE,row.names=NULL) 
+
+# filter data for DHB's is the auckland region
+GPfilter <- GP %>% filter(DHBName %in% c("Counties Manukau","Auckland","Waitemata"))
+
+GPfilter <- GPfilter %>% select('ReportedDate','ILIIncidenceCount') %>% 
+  mutate(ReportedDate=as.Date(ReportedDate,"%d/%m/%Y"),ILIIncidenceCount=as.numeric(ILIIncidenceCount))
+
+finalGP <- GPfilter %>% group_by(ReportedDate) %>% summarise(ILIIncidenceCount=sum(ILIIncidenceCount))
+
+
+```
+Next, we create a time series object and Impute the missing data.
+
+The Imputation here follows 2 steps:
+1. Missing data during surveillance season is the averages of the last count reported the day before and the day after the missing observation
+2. Missing data outside of surveillance season will assume 0 ILI counts
+
+```{r}
+finalGP <- finalGP %>% mutate(ReportedDate = as.Date(ReportedDate)) %>% 
+  complete(ReportedDate = seq.Date(min(ReportedDate), max(ReportedDate), by="day")) 
+
+#create the xts object of GP data starting on day 1 of 2015 until the last day of 2018
+finalGP_365 <- finalGP %>% mutate(ReportedDate = as.Date(ReportedDate)) %>% complete(ReportedDate = seq.Date(as.Date("2015/01/01"), as.Date("2018/12/31"), by="day"))
+# Remove the 4 2019 days at the end of the dataset
+finalGP_365 <- finalGP_365 %>% filter(between(ReportedDate, as.Date("2015/01/01","%Y/%m/%d"), as.Date("2018/12/31","%Y/%m/%d")))
+
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+
+cat("Summary stats of the GP time series object after imputing data: \n")
+head(GP_xts)
+cat("Summary stats of the GP time series object after imputing data: \n")
+summary(GP_xts)
+
+GP_ts <- ts(as.data.frame(coredata(GP_xts)),start=c(2015,as.POSIXlt("2015-01-01")$yday+1),frequency = 365)
+colnames(GP_ts) <- "ILI_Case_Counts"
+
+cat ("Summary of the new data set :",summary(finalGP))
+cat("Number of rows in the dataset after adding back the missing days = ", nrow(finalGP))
+
+```
+
+The following code applies Autoregression using autoregressive order 7 in a rolling forecast without re-estimation
+```{r Autoregression or ARIMA(7,0,0), message=TRUE}
+testset <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)
+trainingset <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365)
+h <- 7
+n <- length(testset) - h + 1
+###############################################
+# Run lag order 7
+fit <- Arima(trainingset, order=c(7,0,0),method = "ML",include.drift = TRUE)
+###############################################
+lag <- 7
+fc <- ts(numeric(n), start=c(2018,(h-1)/365), frequency=365)
+GPlower <- data.frame(NULL)
+GPupper <- data.frame(NULL)
+GPvaldf <- data.frame(NULL)
+GPevaldf <- data.frame(NULL)
+#forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+for(i in 1:n){  
+  #print(paste("window number =",i))
+  dec_date <- (2018.000 + (i-1)/365)
+  #print(dec_date)
+  x <- window(GP_ts,end=dec_date)
+  refit <- Arima(x, model=fit)
+  fceach <- forecast(refit, h=h)
+  #refit <- Arima(x, model=fit_checkno_d)
+  for (pred in 1:h){
+    GPvaldf[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$mean[pred]
+    GPlower[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$lower[pred]
+    GPupper[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$upper[pred]
+  }
+}
+
+#Calculate the accuracy for each day (RMSE & MAPE)
+  GPtest <- as.data.table(testset,keep.rownames=TRUE)
+  GP_test_leads <- GPtest[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols=colnames(testset)]
+  GP_test_leads <- cbind(as.data.frame(time(testset)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+  
+  for (day in 1:7){
+    #eGPvaldf[runrepeat,paste0("rmseDay",day)] <-
+    print(round(rmse(GP_test_leads[121:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldf[121:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+  #evaldf[runrepeat,paste0("maseDay",day)] <-
+    print(round(mae(GP_test_leads[121:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldf[121:274,paste0("PredDay_",day)]),2))
+  }
+```
+ 
+```{r AUTO ARIMA}
+########Run an ARIMA (auto.arima gives the best fitted ARIMA model) model in a rolling forecast without re-estimation
+testsetaa <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)
+trainingsetaa <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365)
+
+##Multi-step forecasts without re-estimation
+h <- 7
+n <- length(testsetaa) - h + 1
+##Run auto ARIMA to optimise the model
+################################################
+#find the best fittig model using auto.arima
+fitaa <- auto.arima(trainingsetaa,max.p = 7,max.q = 7,max.order=14,start.p = 0,start.q = 0,trace = TRUE,seasonal=TRUE, stationary=FALSE,nmodels=1000)
+#################################################
+GPloweraa <- data.frame(NULL)
+GPupperaa <- data.frame(NULL)
+GPvaldfaa <- data.frame(NULL)
+GPevaldfaa <- data.frame(NULL)
+#forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+for(i in 1:n){  
+  print(paste("window number =",i))
+  dec_date <- (2018.000 + (i-1)/365)
+  xaa <- window(GP_ts, end=dec_date)
+  #############################################
+  refit <- Arima(xaa, model=fitaa)
+  #############################################
+  fceachaa <- forecast(refit, h=h)
+  for (pred in 1:h){
+    GPvaldfaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$mean[pred]
+    GPloweraa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$lower[pred]
+    GPupperaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$upper[pred]
+  }
+}
+
+#Calculate the accuracy for each day (RMSE & MAPE)
+#First, create a matrix of 'leads'
+  GPtest <- as.data.table(testsetaa,keep.rownames=TRUE)
+  GP_test_leads <- GPtest[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols=colnames(testsetaa)]
+  GP_test_leads <- cbind(as.data.frame(time(testsetaa)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+  
+  for (day in 1:7){
+    print(round(rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+    print(round(mae(GP_test_leads[121:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+```
+
+```{r ETS model}
+# testsetaa <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)
+# trainingsetaa <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365)
+# 
+# fitets <- ets(trainingsetaa, model = "ZZZ")
+# fitets
+# 
+# autoplot(fitets)
+# cbind('Residuals'=residuals(fitets), "Forecast errors" = residuals(fitets,type='response')) %>% autoplot(facet=TRUE) +xlab("Year") +ylab("")
+# 
+# fitets %>% forecast(h=7) %>% autoplot()
+############
+
+testsetaa <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)
+trainingsetaa <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365)
+
+##Multi-step forecasts without re-estimation
+h <- 7
+n <- length(testsetaa) - h + 1
+##Run auto ARIMA to optimise the model
+################################################
+#fit the ets model
+fitets <- ets(trainingsetaa, model = "ZZZ")
+#################################################
+GPloweraa <- data.frame(NULL)
+GPupperaa <- data.frame(NULL)
+GPvaldfaa <- data.frame(NULL)
+GPevaldfaa <- data.frame(NULL)
+#forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+for(i in 1:n){  
+  print(paste("window number =",i))
+  dec_date <- (2018.000 + (i-1)/365)
+  xaa <- window(GP_ts, end=dec_date)
+  #############################################
+  refit <- ets(xaa, model=fitets)
+  #############################################
+  fceachaa <- forecast(refit, h=h)
+  for (pred in 1:h){
+    GPvaldfaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$mean[pred]
+    GPloweraa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$lower[pred]
+    GPupperaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$upper[pred]
+  }
+}
+
+#Calculate the accuracy for each day (RMSE & MAPE)
+#First, create a matrix of 'leads'
+  GPtest <- as.data.table(testsetaa,keep.rownames=TRUE)
+  GP_test_leads <- GPtest[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols=colnames(testsetaa)]
+  GP_test_leads <- cbind(as.data.frame(time(testsetaa)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+  
+  for (day in 1:7){
+    print(round(rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+    print(round(mae(GP_test_leads[121:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+```
+
+```{r TBATS}
+testsetaa <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)
+trainingsetaa <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365)
+
+##Multi-step forecasts without re-estimation
+h <- 7
+n <- length(testsetaa) - h + 1
+##Run auto ARIMA to optimise the model
+################################################
+#find the best fittig model using 
+fittbats <- tbats(trainingsetaa)
+#################################################
+GPloweraa <- data.frame(NULL)
+GPupperaa <- data.frame(NULL)
+GPvaldfaa <- data.frame(NULL)
+GPevaldfaa <- data.frame(NULL)
+#forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+for(i in 1:n){  
+  print(paste("window number =",i))
+  dec_date <- (2018.000 + (i-1)/365)
+  xaa <- window(GP_ts, end=dec_date)
+  #############################################
+  refit <- tbats(xaa, model=fittbats)
+  #############################################
+  fceachaa <- forecast(refit, h=h)
+  for (pred in 1:h){
+    GPvaldfaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$mean[pred]
+    GPloweraa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$lower[pred]
+    GPupperaa[rownames(as.data.frame(fceachaa))[1],paste("PredDay",pred,sep="_")]<-fceachaa$upper[pred]
+  }
+}
+
+#Calculate the accuracy for each day (RMSE & MAPE)
+#First, create a matrix of 'leads'
+  GPtest <- as.data.table(testsetaa,keep.rownames=TRUE)
+  GP_test_leads <- GPtest[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols=colnames(testsetaa)]
+  GP_test_leads <- cbind(as.data.frame(time(testsetaa)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+  
+  for (day in 1:7){
+    print(round(rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+    print(round(mae(GP_test_leads[121:274,(paste0("ILI_Case_Counts_lead_",day))],GPvaldfaa[121:274,paste0("PredDay_",day)]),2))
+  }
+```
+
+
+```{r Random Forest}
+#create the xts object of our data
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+#impute missing data
+#first impute values of missing data during surveillance season to bethe average of a day before and after the missing value
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+#next set all other values outside the surveillance season (i.e. month 0-3 and 9-12) to 
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+#lag <- 30
+lag <- 7
+leadval <- 7 #This is the same value as the number of days we are looking to forecast
+#########
+#create target and predictor features
+GP <- as.data.table(GP_xts,keep.rownames = TRUE)
+colnames(GP) <- c("Date","GP_ILI_count")
+GP_all_leads <- GP[,shift(.SD,1:leadval,type="lead",give.names = TRUE), .SDcols="GP_ILI_count"]
+GP_all_leads <- cbind(GP$Date,GP_all_leads)
+GP_all_leads<-na.exclude(GP_all_leads)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+GP_all_leads <- GP_all_leads[-(1:lag),]
+
+GP_all <- GP[,shift(.SD,1:lag,type="lag",give.names = TRUE), .SDcols="GP_ILI_count"]
+GP_all <- cbind(GP,GP_all)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+GP_all <- GP_all[-((nrow(GP_all)-(leadval-1)):nrow(GP_all)),]
+GP_all<-na.exclude(GP_all)
+
+GP_all <- xts(GP_all[,-1],order.by = GP_all$Date)
+
+#prepare test and training sets
+
+#trainingData <- window(GP_all,end='2018-04-30')
+trainingData <- window(GP_all,end='2017-12-31')
+train_target <- trainingData$GP_ILI_count
+train_predictor <- trainingData[, -1]
+
+GP_all_leads <- xts(GP_all_leads[,-1],order.by = GP_all_leads$V1)
+train_leads <- window(as.xts(GP_all_leads),end='2017-12-31')
+
+testData <- window(GP_all,start='2018-01-01') 
+test_leads <- window(GP_all_leads,start='2018-01-01')
+###############################
+horizon <- 7
+forecasts_rf <- numeric(horizon)
+vnewRF <- list()
+###############################
+#set.seed(1)
+ #set.seed(2)
+ #set.seed(3)
+ #set.seed(4)
+ #set.seed(5)
+#set.seed(6)
+ set.seed(7)
+# set.seed(8)
+# set.seed(9)
+# set.seed(10)
+#fit_rf <- randomForest(GP_ILI_count~.,trainingData,ntree=500,importance=TRUE)
+for (days in 1:horizon){
+  cat("#################Horizon: ",days,"\n")
+  horizon <- as.numeric(str_sub(days,start = -1))
+  ##Reshape training set
+  train_target <- train_leads[,paste0("GP_ILI_count_lead_", horizon)]
+  y_Test <- test_leads[,paste0("GP_ILI_count_lead_", horizon)]
+  if (days == 1) {
+    train_predictor <- trainingData
+    X_test <- testData
+  }else{
+    prev_horizon_realvalues <- train_leads[,paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1),start = -1)))]
+    train_predictor <- merge(train_predictor,prev_horizon_realvalues)
+    fc_xts <- xts(vnewRF[[(days-1)]],order.by=as.Date(time(test_leads)))
+    colnames(fc_xts) <- paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1))))
+    X_test <- merge(X_test,fc_xts)
+    #X_test <- merge(X_test,test_leads[,paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1),start = -1)))])
+  }
+  forecasts_rf <- numeric(horizon)  
+  ##################################################################
+  #Run a random forest model
+  #fit_rf <- randomForest(train_predictor,train_target,mtry=6,ntree=500,importance=TRUE)
+  fit_rf <- tuneRF(train_predictor,train_target,ntreeTry = 500,plot=TRUE,doBest=TRUE)
+  ##################################################################
+  #Run a regressiong tree
+  #new_train <- cbind(train_target,train_predictor)
+  #formulas <- as.formula(paste(colnames(new_train[,1]),"~",paste(colnames(new_train[,-1]),collapse = "+")))
+  #fit_rf <- rpart(formulas,as.data.frame(new_train))
+  ##################################################################
+  forecasts_rf <- predict(fit_rf, X_test)
+  vnewRF[[days]] <- as.data.frame(forecasts_rf)
+}
+
+vals <- data.frame(vnewRF)
+names(vals) <- paste0("Pred", 1:days)
+for (day in 1:7){
+    print(round(rmse(test_leads[122:274,(paste0("GP_ILI_count_lead_",day))],vals[122:274,paste0("Pred",day)]),2))
+  }
+  for (day in 1:7){
+    print(round(mae(test_leads[122:274,(paste0("GP_ILI_count_lead_",day))],vals[122:274,paste0("Pred",day)]),2))
+  }
+
+
+```
+
+```{r}
+
+########### Run REACH with RF model on GP data
+################
+ndays <- 7
+###############
+#create a vector of names for x days into the future
+namevect <- NULL
+  for (nd in 1:ndays){
+  newcol <- paste('ili.plus',nd)
+  newcol <- str_replace_all(string=newcol, pattern=" ", repl="")
+  print (newcol)
+  namevect <- c(namevect,newcol)
+}
+
+#the steps to generate GP_xts and GP_ts done in a code block above
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+#impute missing data
+#first impute values of missing data during surveillance season to bethe average of a day before and after the missing value
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+#next set all other values outside the surveillance season (i.e. month 0-3 and 9-12) to 0
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+######################
+#lag <- 30
+lag <- 7
+leadval <- 7
+######################
+######################
+nrepeats <- 10
+######################
+#create target and predictor features
+GP <- as.data.table(GP_xts,keep.rownames = TRUE)
+colnames(GP) <- c("Date","GP_ILI_count")
+GP_allCC_leads <- GP[,shift(.SD,1:leadval,type="lead",give.names = TRUE), .SDcols="GP_ILI_count"]
+GP_allCC_leads <- cbind(GP$Date,GP_allCC_leads)
+GP_allCC_leads<-na.exclude(GP_allCC_leads)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+GP_allCC_leads <- GP_allCC_leads[-(1:lag),]
+GP_allCC <- GP[,shift(.SD,1:lag,type="lag",give.names = TRUE), .SDcols="GP_ILI_count"]
+GP_allCC <- cbind(GP,GP_allCC)
+GP_allCC <- na.exclude(GP_allCC)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+GP_allCC <- GP_allCC[-((nrow(GP_allCC)-(leadval-1)):nrow(GP_allCC)),]
+
+GP_allCC <- xts(GP_allCC[,-1],order.by = GP_allCC$Date)
+trainingDataCC <- window(GP_allCC,end='2017-12-31')
+
+GP_allCC_leads <- xts(GP_allCC_leads[,-1],order.by = as.Date(GP_allCC_leads$V1))
+train_leadsCC <- window(as.xts(GP_allCC_leads),end='2017-12-31')
+testDataCC <- window(GP_allCC,start='2018-01-01') 
+test_leadsCC <- window(GP_allCC_leads,start='2018-01-01')
+
+#set.seed(1)
+ #set.seed(2)
+#set.seed(3)
+#set.seed(4)
+ #set.seed(5)
+ #set.seed(6)
+ #set.seed(7)
+set.seed(8)
+# set.seed(9)
+# set.seed(10)
+
+#run a classifier chain
+rememberorder <- NULL
+Preddf_list <- list()
+v_new <- list() 
+for (repeats in 1:nrepeats){
+  #set.seed(50)
+  cat("##################Repeat number",repeats,"\n")
+  numberofdays <- sample(namevect)
+  cat("#################The order of predictions: ",numberofdays,"\n")
+  rememberorder[repeats] <- list(numberofdays)
+  for (days in 1:length(numberofdays)){
+    horizonCC <- as.numeric(str_sub(numberofdays[days],start = -1))
+    cat("#################Horizon: ",horizonCC,"\n")
+    ##Reshape training set
+    train_targetCC <- train_leadsCC[,paste0("GP_ILI_count_lead_", horizonCC)]
+    y_testCC <- test_leadsCC[,paste0("GP_ILI_count_lead_", horizonCC)]
+    if (days == 1) {
+      train_predictorCC <- trainingDataCC
+      X_testCC <- testDataCC
+    }else{
+      prev_horizon_realvalues <- train_leadsCC[,paste0("GP_ILI_count_lead_",as.numeric(str_sub(numberofdays[days-1],start = -1)))]
+      train_predictorCC <- merge(train_predictorCC,train_leadsCC[,paste0("GP_ILI_count_lead_",as.numeric(str_sub(numberofdays[days-1],start = -1)))])
+      #train_predictorCC <- na.exclude(train_predictorCC)
+      forecasted_day <- as.numeric(str_sub(numberofdays[days-1],start = -1))
+      fc_xtsCC <- xts(v_new[[(forecasted_day)]],order.by = as.Date(time(test_leadsCC)))
+      colnames(fc_xtsCC) <- paste0("GP_ILI_count_lead_",as.numeric(str_sub((forecasted_day))))
+      X_testCC <- merge(X_testCC,fc_xtsCC)
+    }
+    forecasts_rfCC <- numeric(horizonCC)            
+    ##############################################################################
+    fit_rfCC <- tuneRF(train_predictorCC,train_targetCC,ntreeTry = 500,plot=TRUE,doBest=TRUE)
+    ##############################################################################
+    forecasts_rfCC <- predict(fit_rfCC, X_testCC)
+    v_new[[horizonCC]] <- as.vector(forecasts_rfCC)
+  }
+  vals <- data.frame(v_new)
+  names(vals) <- paste0("Pred", 1:days)
+  Preddf_list [[repeats]] <- vals
+}
+                                        
+all <- data.frame(Preddf_list)
+medians <- list()
+# Median of the forecasts produced by the number of runs
+for (n in 1:ndays){
+  d <-paste0("Pred",n)
+  medians[[n]] <- apply(all[,grepl(d,colnames(all))],1,median)
+}
+
+median_of_pred <- data.frame(medians)
+names(median_of_pred) <- paste0("Pred", 1:ndays)
+
+for (day in 1:7){
+    print(round(rmse(test_leadsCC[122:274,(paste0("GP_ILI_count_lead_",day))],median_of_pred[122:274,paste0("Pred",day)]),2))
+}
+
+  for (day in 1:7){
+    print(round(mae(test_leadsCC[122:274,(paste0("GP_ILI_count_lead_",day))],median_of_pred[122:274,paste0("Pred",day)]),2))
+  }
