@@ -1,0 +1,746 @@
+---
+title: "GP_Weather Data - Autoregression; ARIMA; regression_trees"
+output: html_notebook
+---
+
+```{r install libraries}
+install.packages(c("mosaicData","dplyr","forecast","ggplot2","tidyr","imputeTS","xts","tsbox","Metrics","lubridate"))
+library(mosaicData)
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(tidyr)
+library(imputeTS)
+library(xts)                        
+library(tsbox)
+library(Metrics)
+library(lubridate)
+```
+
+
+```{r}
+GPw<-read.csv(file="~/Google Drive/My Drive/PhD/Data/ILI_data_06_03_2019.csv",sep="\t",header=TRUE,row.names=NULL) 
+
+# filter data for DHB's is the auckland region
+GPwfilter <- GPw %>% filter(DHBName %in% c("Counties Manukau","Auckland","Waitemata"))
+
+GPwfilter <- GPwfilter %>% select('ReportedDate','ILIIncidenceCount') %>% 
+  mutate(ReportedDate=as.Date(ReportedDate,"%Y/%m/%d"),ILIIncidenceCount=as.numeric(ILIIncidenceCount))
+
+finalwGP <- GPwfilter %>% group_by(ReportedDate) %>% summarise(ILIIncidenceCount=sum(ILIIncidenceCount))
+
+cat("Number of rows in the final aggregated dataset = ", nrow(finalGP))
+
+```
+The data collected are from days starting on 21-05-2015 until 05-03-2019 which means the total number of days the dataset should represent is 1385 (i.e. 1385 rows).  
+From the Summary above, we see that we have 528 rows of data which means the other 857 days are missing. 
+ILI surveillance is conducted each year from April - September each year, hence the data is recorded for those times of the year.
+Now create rows for those missing days:
+```{r}
+
+finalGP <- finalGP %>% mutate(ReportedDate = as.Date(ReportedDate)) %>% 
+  complete(ReportedDate = seq.Date(min(ReportedDate), max(ReportedDate), by="day")) 
+
+#create the xts object of GP data starting on day 1 of 2015 until the last day of 2018
+finalGP_365 <- finalGP %>% mutate(ReportedDate = as.Date(ReportedDate)) %>% complete(ReportedDate = seq.Date(as.Date("2015/01/01"), as.Date("2018/12/31"), by="day"))
+# Remove the 4 2019 days at the end of the dataset
+finalGP_365 <- finalGP_365 %>% filter(between(ReportedDate, as.Date("2015/01/01","%Y/%m/%d"), as.Date("2018/12/31","%Y/%m/%d")))
+
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+
+cat("Summary stats of the GP time series object after imputing data: \n")
+head(GP_xts)
+cat("Summary stats of the GP time series object after imputing data: \n")
+summary(GP_xts)
+
+GP_ts <- ts(as.data.frame(coredata(GP_xts)),start=c(2015,as.POSIXlt("2015-01-01")$yday+1),frequency = 365)
+colnames(GP_ts) <- "ILI_Case_Counts"
+
+cat ("Summary of the new data set :",summary(finalGP))
+cat("Number of rows in the dataset after adding back the missing days = ", nrow(finalGP))
+```
+Load and process the weather data
+```{r}
+#load and filter min and max temperature for a date
+temp<-read.table(file="~/Google Drive/My Drive/PhD/Data/Akl_temp2015.txt",sep="\t",header=TRUE,row.names=NULL,skip=10,stringsAsFactors = FALSE,fill = TRUE)
+
+filtered_tempdata <- temp %>% select('Date.NZST.', 'Tmax.C.','Tmin.C.') %>% 
+  mutate(Date.NZST.=as.Date(Date.NZST.,"%d/%m/%Y"),Tmax.C.=as.numeric(Tmax.C.),Tmin.C.=as.numeric(Tmin.C.))
+
+filtered_tempdata <- filtered_tempdata %>% group_by(Date.NZST.) %>% summarise(mean(Tmax.C.),mean(Tmin.C.))
+
+head(filtered_tempdata)
+glimpse(filtered_tempdata)
+
+#filter and combine rain data with temperature data
+raindata<-read.table(file="~/Google Drive/My Drive/PhD/Data/Akl_dailyrain2015.txt",sep="\t",header=TRUE,row.names=NULL,skip=10,fill = TRUE) 
+
+filtered_raindata <- raindata %>% select('Date.NZST.','Amount.mm.') %>% 
+  mutate(Date.NZST.=as.Date(Date.NZST.,"%d/%m/%Y"),Amount.mm.=as.numeric(Amount.mm.))
+
+filtered_raindata <- filtered_raindata %>% group_by(Date.NZST.) %>% summarise(mean(Amount.mm.))
+
+combine<- full_join(filtered_tempdata,filtered_raindata,by='Date.NZST.')
+
+##filter and combine humidity data with temperature data - not enough data, download again
+humidity<-read.table(file="~/Google Drive/My Drive/PhD/Data/Akl_humidity2015.txt",sep="\t",header=TRUE,row.names=NULL,skip=10,fill=TRUE) 
+
+filtered_humidity <- humidity %>% select(Date.NZST.,RH...,Tdew.C.) %>% 
+  mutate(Date.NZST.=as.Date(Date.NZST.,"%d/%m/%Y"),  RH...=as.numeric(RH...),Tdew.C.=as.numeric(Tdew.C.))
+
+filtered_humidity <- filtered_humidity %>% group_by(Date.NZST.) %>% 
+  summarise(mean(RH...),mean(Tdew.C.))
+
+finalWeather<- full_join(combine,filtered_humidity,by='Date.NZST.')
+
+finalWeather <- finalWeather %>% rename("Tmax.C."=`mean(Tmax.C.)`,"Tmin.C."=`mean(Tmin.C.)`,"Relative.Humidity."=`mean(RH...)`,"Rainfall.mm."=`mean(Amount.mm.)`,"Tdew.C."=`mean(Tdew.C.)`) 
+
+finalWeather <- finalWeather %>% add_row(Date.NZST.=as.Date("31/12/2018","%d/%m/%Y"),Tmax.C.=NA,Tmin.C.=NA,Relative.Humidity.=NA,Rainfall.mm.=NA,Tdew.C.=NA)
+
+#write.csv(finalWeather,file = "~/Google Drive File Stream/My Drive/PhD/Data/WeatherPredictors.csv")
+
+##subset the combined weather data to extract data from dates that match the GP data
+#finalWeather<- finalWeather %>% filter(between(Date.NZST., as.Date("21/05/2015","%d/%m/%Y"), as.Date("05/03/2019","%d/%m/%Y")))
+
+cat("Summary stats of the GP time series object: \n",summary(finalWeather))
+
+#combine GP and weather data
+GPdata <- finalGP_365 %>% rename(Date.NZST.= ReportedDate)
+WeatherGP <- full_join(GPdata,finalWeather,by='Date.NZST.')
+
+#tidy up names etc. of the weather data variables
+WeatherGP <- WeatherGP %>% mutate(ILIIncidenceCount=as.numeric(ILIIncidenceCount))
+#WeatherGP <- WeatherGP %>% rename("Tmax.C."=`mean(Tmax.C.)`,"Tmin.C."=`mean(Tmin.C.)`,"Relative.Humidity."=`mean(RH...)`,"Rainfall.mm."=`mean(Amount.mm.)`,"Tdew.C."=`mean(Tdew.C.)`,"ILI.GP."=ILIIncidenceCount)
+
+#plot(WeatherGP$Date.NZST.,WeatherGP$ILI.GP.)
+glimpse(WeatherGP)
+
+```
+
+```{r Create weather and GP ts/xts objects}
+#######creat ts and xts object of GP data with 365 days in the year
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+
+GP_ts <- ts(as.data.frame(coredata(GP_xts)), start=c(2015,as.POSIXlt("2015-01-01")$yday+1),frequency = 365)
+colnames(GP_ts) <- "ILI_Case_Counts"
+
+colnames(GP_ts) <- "ILI_Case_Counts"
+
+Weather_xts <- xts(finalWeather[,-1],order.by = finalWeather$Date.NZST.)
+summary(Weather_xts)
+Weather_xts<-na_ma(Weather_xts,k=1,weighting='simple')
+#Weather_ts <-ts(as.data.frame(coredata(Weather_xts)),start=c(2015,as.POSIXlt("2015-05-21")$yday+1),frequency = 365)
+Weather_ts <-ts(as.data.frame(coredata(Weather_xts)),start=c(2015,as.POSIXlt("2015-05-21")$yday+1),frequency = 365)
+
+```
+```{r Autoregression with external regressors}
+testset <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)## calculate days within flu season and add that as a frequency || Try frequency 7
+#test <- window(GP_ts,start=c(2018,as.POSIXlt("2018-05-01")$yday+1),end=c(2018,as.POSIXlt("2018-09-30")$yday+1),frequency=153)
+trainingset <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365) ### frequency=7| try 
+### Prepare the weather data - create lags 
+lagval <- 7
+W <- as.data.table(Weather_xts,keep.rownames = TRUE)
+#https://www.rdocumentation.org/packages/data.table/versions/1.13.0/topics/shift
+cols <- colnames(W[,!("index")])
+newcols <- paste("lag", cols, sep="_")
+W_all_lags <- W[, shift(.SD,1:lagval,type="lag",give.names = TRUE), .SDcols=cols]
+#xreg must be a matrix https://stats.stackexchange.com/questions/41070/how-to-setup-xreg-argument-in-auto-arima-in-r
+W_all_lags <- as.matrix(W_all_lags)
+WeatherTrain <- W_all_lags[1:length(trainingset),]
+WeatherTest <- W_all_lags[(length(trainingset)+1):length(testset),]
+## remove rows with missing lag values
+WeatherTrain <- WeatherTrain[-(1:lagval),]
+trainingset <- trainingset[-(1:lagval),]
+W_all_lags <- W_all_lags[-(1:lagval),]
+GP_ts_aa <- ts(GP_ts[-(1:lagval),],start=c(2015,(lagval+1)),frequency = 365)
+
+nrow(trainingset) == nrow(WeatherTrain)
+
+evaldf <- data.frame(NULL)
+################
+runrepeat <- 10
+###############
+#for (r in 1:runrepeat){
+  h <- 7
+  n <- length(testset) - h
+  ###############################################
+  fit <- arima(trainingset,order=c(7,0,0),xreg=WeatherTrain)
+  ###############################################
+  lower <- data.frame(NULL)
+  valdf <- data.frame(NULL)
+  upper <- data.frame(NULL)
+  #forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+  for(i in 1:n){  
+    print(paste("window number =",i))
+    dec_date <- (2018.000 + (i-1)/365)
+    x <- window(GP_ts_aa, end=dec_date)
+    currentrow <- nrow(WeatherTrain)+i
+    regressors <- W_all_lags[1:(currentrow),]
+    regressors_fc <- W_all_lags[((currentrow):(currentrow+h)),]
+    refit <- Arima(x, model=fit,xreg = regressors)
+    fceach <- forecast(refit,h=h,xreg = regressors_fc)
+    for (pred in 1:h){
+      valdf[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$mean[pred]
+      lower[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$lower[pred]
+      upper[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$upper[pred]
+    }
+  }
+  
+  #Calculate the accuracy for each day (RMSE & MAPE)
+  test <- as.data.table(testset,keep.rownames=TRUE)
+  GP_test_leads <- test[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols="ILI_Case_Counts"]
+  dates <- as.data.frame(time(testset))
+  GP_test_leads <- cbind(as.data.frame(time(testset)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+
+  for (day in 1:7){
+    #evaldf[runrepeat,paste0("rmseDay",day)] <-
+    print(round(rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+  #evaldf[runrepeat,paste0("maseDay",day)] <-
+    print(round(mae(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)]),2))
+  }
+```
+
+
+```{r ARIMA with external regressors}
+testset <- window(GP_ts,start=c(2018,as.POSIXlt("2018-01-01")$yday+1),end=c(2018,as.POSIXlt("2018-12-31")$yday+1),frequency=365)## calculate days within flu season and add that as a frequency || Try frequency 7
+#test <- window(GP_ts,start=c(2018,as.POSIXlt("2018-05-01")$yday+1),end=c(2018,as.POSIXlt("2018-09-30")$yday+1),frequency=153)
+trainingset <- window(GP_ts,end=c(2017,as.POSIXlt("2017-12-31")$yday+1),frequency=365) ### frequency=7| try 
+### Prepare the weather data - create lags 
+lagval <- 7
+W <- as.data.table(Weather_xts,keep.rownames = TRUE)
+#https://www.rdocumentation.org/packages/data.table/versions/1.13.0/topics/shift
+cols <- colnames(W[,!("index")])
+newcols <- paste("lag", cols, sep="_")
+W_all_lags <- W[, shift(.SD,1:lagval,type="lag",give.names = TRUE), .SDcols=cols]
+#xreg must be a matrix https://stats.stackexchange.com/questions/41070/how-to-setup-xreg-argument-in-auto-arima-in-r
+W_all_lags <- as.matrix(W_all_lags)
+WeatherTrain <- W_all_lags[1:length(trainingset),]
+WeatherTest <- W_all_lags[(length(trainingset)+1):length(testset),]
+## remove rows with missing lag values
+WeatherTrain <- WeatherTrain[-(1:lagval),]
+trainingset <- trainingset[-(1:lagval),]
+W_all_lags <- W_all_lags[-(1:lagval),]
+GP_ts_aa <- ts(GP_ts[-(1:lagval),],start=c(2015,(lagval+1)),frequency = 365)
+
+nrow(trainingset) == nrow(WeatherTrain)
+
+evaldf <- data.frame(NULL)
+################
+runrepeat <- 10
+###############
+#for (r in 1:runrepeat){
+  h <- 7
+  n <- length(testset) - h
+  ###############################################
+  fit <- auto.arima(trainingset,max.p = 7,max.q = 7,start.p = 0,start.q = 0,trace = TRUE,nmodels=500,xreg=WeatherTrain,seasonal = TRUE,stationary = FALSE)  ## This auto arima run resulted in model 
+  #fit <- auto.arima(trainingset,max.p = 7,max.q = 7,start.p = 0,start.q = 0,trace = TRUE,nmodels=500,xreg=WeatherTrain)  ## This auto arima run resulted in model (7,1,7)
+   #ARIMA(7,1,5)                    : 4808.975 <- model without 
+  #fit <- arima(trainingset,order=c(7,1,7),xreg=WeatherTrain)
+  ###############################################
+  lower <- data.frame(NULL)
+  valdf <- data.frame(NULL)
+  upper <- data.frame(NULL)
+  #forecast_window_start <- as.POSIXlt("2018-05-21")$yday+1
+  for(i in 1:n){  
+    print(paste("window number =",i))
+    dec_date <- (2018.000 + (i-1)/365)
+    x <- window(GP_ts_aa, end=dec_date)
+    currentrow <- nrow(WeatherTrain)+i
+    regressors <- W_all_lags[1:(currentrow),]
+    regressors_fc <- W_all_lags[((currentrow):(currentrow+h)),]
+    refit <- Arima(x, model=fit,xreg = regressors)
+    fceach <- forecast(refit,h=h,xreg = regressors_fc)
+    for (pred in 1:h){
+      valdf[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$mean[pred]
+      lower[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$lower[pred]
+      upper[rownames(as.data.frame(fceach))[1],paste("PredDay",pred,sep="_")]<-fceach$upper[pred]
+    }
+  }
+  
+  #Calculate the accuracy for each day (RMSE & MAPE)
+  test <- as.data.table(testset,keep.rownames=TRUE)
+  GP_test_leads <- test[,shift(.SD,1:h,type="lead",give.names = TRUE), .SDcols="ILI_Case_Counts"]
+  dates <- as.data.frame(time(testset))
+  GP_test_leads <- cbind(as.data.frame(time(testset)),GP_test_leads)
+  GP_test_leads<-na.exclude(GP_test_leads)
+  GP_test_leads<-as.data.frame(GP_test_leads)
+
+  for (day in 1:7){
+    #evaldf[runrepeat,paste0("rmseDay",day)] <-
+    print(round(rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)]),2))
+  }
+  for (day in 1:7){
+  #evaldf[runrepeat,paste0("maseDay",day)] <-
+    print(round(mae(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)]),2))
+  }
+
+```
+
+
+```{r Run a random forest/decision tree with weather and GP data - DECOMPOSED- NOT WORKING }
+W_xts <- xts(finalWeather[,-1],order.by=finalWeather$Date.NZST.)
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+#impute missing data
+#first impute values o0f missing data during surveillance season to bethe average of a day before and after the missing value
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+#next set all other values outside the surveillance season (i.e. month 0-3 and 9-12) to 0
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+####Remove months with no data 
+#GP_xts <- na.exclude(GP_xts)
+#######################################
+#DECOMPOSE the time series
+GP_ts <- ts(as.data.frame(coredata(GP_xts)),start=c(2015,as.POSIXlt("2015-01-01")$yday+1),frequency = 365)
+test_all <- window(GP_xts,start='2018-05-01',end='2018-09-30') 
+#Decompose the time series in its 3 components
+series <- decompose(GP_ts,type="additive")
+plot(series)
+#########################################
+#lag <- 30
+lagval <- 7
+leadval <- 7 #This is the same value as the number of days we are looking to forecast
+####################
+#######First, check formatting of series$random and convert to xts object
+GP_ts_random <- ts(coredata(series$random),start=c(2015,as.POSIXlt("2015-01-01")$yday+1),frequency=365)
+GP_xts_random <- xts(coredata(series$random),order.by = seq.Date(as.Date("2015/01/01"), as.Date("2018/12/31"), by="day"))
+colnames(GP_xts_random) = "ILIIncidenceCount"
+GP_xts_random[.indexmon(GP_xts_random) %in% c(0:3,9:12)] <- 0
+WGP_xts <- merge.xts(GP_xts_random,W_xts)
+## 
+WGP <- as.data.table(WGP_xts,keep.rownames = TRUE)
+GP_random <- as.data.table(GP_xts_random,keep.rownames = TRUE)
+######################################################
+##Create leads of weather and random component of GP - leads only needed for GP counts and not the the weather - we do not have weather forecasts
+WTime_leads <- GP_random[,shift(.SD,1:leadval,type="lead",give.names = TRUE), .SDcols=c("ILIIncidenceCount")]
+WTime_leads <- cbind(GP_random$index,WTime_leads)
+#WTime_leads<-na.exclude(WTime_leads)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WTime_leads <- WTime_leads[-(1:lagval),]
+WTime_leads <- WTime_leads[-((nrow(WTime_leads)-(leadval-1)):nrow(WTime_leads)),]
+##create lags
+WGP_all <- WGP[,shift(.SD,1:lagval,type="lag",give.names = TRUE), .SDcols=2:ncol(WGP)]
+WGP_all <- cbind(WGP,WGP_all)
+#WGP_all<-na.exclude(WGP_all)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WGP_all <- WGP_all[-((nrow(WGP_all)-(leadval-1)):nrow(WGP_all)),]
+WGP_all <- WGP_all[-(1:lagval),]
+
+#prepare test and training sets
+WGP_all_xts <- xts(WGP_all[,-1],order.by = WGP_all$index)
+WTime_leads_xts <- xts(WTime_leads[,-1],order.by = WTime_leads$V1)
+
+trainingData <- window(WGP_all_xts,end='2017-12-31')
+train_leads <- window(WTime_leads_xts,end='2017-12-31')
+testData <- window(WGP_all_xts,start='2018-01-01',end='2018-12-31') 
+test_leads <- window(WTime_leads_xts,start='2018-01-01',end='2018-12-31')
+horizon <- 7
+forecasts_rf <- numeric(horizon)
+vnewRF <- list()
+for (days in 1:horizon){
+  cat("#################Horizon: ",days,"\n")
+  ##Reshape training set
+  train_target <- train_leads[,(paste0("ILIIncidenceCount_lead_", days))]
+  test_target <- test_leads[,paste0("ILIIncidenceCount_lead_", days)]
+  if (days == 1) {
+    train_predictor <- trainingData
+    test_predictor <- testData ## **********Use forecasts
+  }else{
+    prev_horizon_realvalues <- train_leads[,paste0("ILIIncidenceCount_lead_",as.numeric(str_sub((days-1),start = -1)))]
+    train_predictor <- merge(train_predictor,prev_horizon_realvalues)
+    fc_xts <- xts(vnewRF[[(days-1)]],order.by=as.Date(rownames(vnewRF[[(days-1)]])))
+    colnames(fc_xts) <- paste0("ILIIncidenceCount_lead_",as.numeric(str_sub((days-1))))
+    test_predictor <- merge(test_predictor,fc_xts)
+    #test_predictor <- merge(test_predictor,test_leads[,paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1),start = -1)))])
+  }
+  forecasts_rf <- numeric(horizon)  
+  ##################################################################
+  #Run a random forest model
+  new_train <- cbind(train_target,train_predictor)
+  formulas <- as.formula(paste(colnames(new_train[,1]),"~",paste(colnames(new_train[,-1]),collapse = "+")))
+  # Algorithm Tune (tuneRF)
+  set.seed(1525)
+  #bestmtry <- tuneRF(new_train[,-1],new_train[,1],stepFactor=1.5, improve=0.05, ntree=500,na.action = na.omit)
+  #print(bestmtry)
+  fit_rf <- randomForest(formulas,as.data.frame(new_train),importance=TRUE,ntree=500,mtry=2,na.action = na.omit)
+  ##################################################################
+  #Run a regression tree
+  #new_train <- cbind(train_target,train_predictor)
+  #formulas <- as.formula(paste(colnames(new_train[,1]),"~",paste(colnames(new_train[,-1]),collapse = "+")))
+  #fit_rf <- rpart(formulas,as.data.frame(new_train))
+  ##################################################################
+  forecasts_rf <- predict(fit_rf, test_predictor)
+  vnewRF[[days]] <- as.data.frame(forecasts_rf)
+}
+vals <- data.frame(vnewRF)
+names(vals) <- paste0("Pred", 1:days)
+#### compare the random forecasts
+####Evaluate RANDOM component only
+test_all_random <- window(GP_xts_random,start='2018-01-01',end='2018-12-31')
+test_all_random <- test_all_random[,shift(.SD,1:horizon,type="lead",give.names = TRUE)]
+GP_random_leads <- cbind(GP$Date,GP_random_leads)
+GP_random_leads<-na.exclude(GP_random_leads)
+GP_random_leads<-as.data.frame(GP_random_leads)
+  
+for (day in 1:horizon){
+    evaldf[,paste0("rmseDay",day)] <- rmse(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)])
+    evaldf[,paste0("maseDay",day)] <- mase(GP_test_leads[122:274,(paste0("ILI_Case_Counts_lead_",day))],valdf[122:274,paste0("PredDay_",day)])
+  }
+
+lead7_random <- lead(coredata(test_all_random),7)
+rmse(lead7_random[2:56],vals$Pred7[2:56])
+
+## Put the time series back together
+# we forecasted the random component and all the values are in "vals"
+# lets look at series$trend and series$seasonal
+head(series$seasonal)
+head(series$trend)
+trend <- window(series$trend,start=c(2017,as.POSIXlt("2017-05-01")$yday+1),end=c(2017,as.POSIXlt("2017-09-30")$yday+1),frequency=365)
+#### forecast trend
+
+sesonal <- window(series$seasonal,start=c(2017,as.POSIXlt("2017-05-01")$yday+1),end=c(2017,as.POSIXlt("2017-09-30")$yday+1),frequency=365)
+val_final <- list()
+for (v in 1:ncol(vals)){
+  val_final[[v]] <- vals[,v]+sesonal+trend
+}
+valsF <- data.frame(val_final)
+names(valsF) <- paste0("Pred", 1:v)
+
+plot(vals$Pred1[1:65])
+plot(valsF$Pred1[1:65])
+
+#Calculate the mean RMSE for each day 
+lead1_org <- lead(coredata(test_all),1)
+rmse(lead1_org[2:62],valsF$Pred1[2:62])
+lead2_org <- lead(coredata(test_all),2)
+rmse(lead2_org[2:61],valsF$Pred2[2:61])
+lead3_org <- lead(coredata(test_all),3)
+rmse(lead3_org[2:60],valsF$Pred3[2:60])
+lead4_org <- lead(coredata(test_all),4)
+rmse(lead4_org[2:59],valsF$Pred4[2:59])
+lead5_org <- lead(coredata(test_all),5)
+rmse(lead5_org[2:58],valsF$Pred5[2:58])
+lead6_org <- lead(coredata(test_all),6)
+rmse(lead6_org[2:57],valsF$Pred6[2:57])
+lead7_org <- lead(coredata(test_all),7)
+rmse(lead7_org[2:56],valsF$Pred7[2:56])
+
+```
+
+```{r Run a random forest with Weather + GP not decomposed}
+#create the xts object of our data
+GP_xts <- xts(finalGP_365$ILIIncidenceCount,order.by=finalGP_365$ReportedDate)
+#impute missing data
+#first impute values o0f missing data during surveillance season to bethe average of a day before and after the missing value
+GP_xts<-na_ma(GP_xts,k=1,weighting='simple')
+#next set all other values outside the surveillance season (i.e. month 0-3 and 9-12) to 0
+GP_xts[.indexmon(GP_xts) %in% c(0:3,9:12)] <- 0 
+colnames(GP_xts) <- "GP_ILI_count"
+WGP_xts <- xts(WeatherGP[,-1],order.by = WeatherGP$Date.NZST.)
+WGP_xts<-na_ma(WGP_xts,k=1,weighting='simple')
+#####create a stationary time series
+# nd <- nsdiffs(GP_ts)
+# GP_tsdiff1 <- diff(GP_ts, differences=nd)
+# GP_tsdiff1 <- xts(GP_tsdiff1,order.by=as.Date(finalGP_365$ReportedDate[-nd]))
+#######################################
+#lag <- 30
+lagval <- 7
+leadval <- 7 #This is the same value as the number of days we are looking to forecast
+#########
+#create target and predictor features
+GP <- as.data.table(GP_xts,keep.rownames = TRUE)
+WTime_leads <- GP[,shift(.SD,1:leadval,type="lead",give.names = TRUE), .SDcols=2:ncol(GP)]
+WTime_leads <- cbind(GP$index,WTime_leads)
+#WTime_leads<-na.exclude(WTime_leads)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WTime_leads <- WTime_leads[-(1:lagval),]
+WTime_leads <- WTime_leads[-((nrow(WTime_leads)-(leadval-1)):nrow(WTime_leads)),]
+##create lags
+WGP <- as.data.table(WGP_xts,keep.rownames = TRUE)
+WGP_all <- WGP[,shift(.SD,1:lagval,type="lag",give.names = TRUE), .SDcols=2:ncol(WGP)]
+WGP_all <- cbind(WGP,WGP_all)
+#WGP_all<-na.exclude(WGP_all)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WGP_all <- WGP_all[-((nrow(WGP_all)-(leadval-1)):nrow(WGP_all)),]
+WGP_all <- WGP_all[-(1:lagval),]
+#prepare test and training sets
+WGP_all_xts <- xts(WGP_all[,-1],order.by = WGP_all$index)
+WTime_leads_xts <- xts(WTime_leads[,-1],order.by = WTime_leads$V1)
+
+#trainingData <- window(GP_all,end='2018-04-30')
+trainingData <- window(WGP_all_xts,end='2017-12-31')
+train_target <- trainingData$WGP_ILI_count
+train_predictor <- trainingData[, -1]
+
+#train_leads <- window(as.xts(WGP_all_leads),end='2018-04-30')
+train_leads <- window(WTime_leads_xts,end='2017-12-31')
+
+# testData <- window(WGP_all,start='2018-05-01',end='2018-09-30') 
+# test_leads <- window(WGP_all_leads,start='2018-05-01',end='2018-09-30')
+testData <- window(WGP_all_xts,start='2018-01-01') 
+test_leads <- window(WTime_leads_xts,start='2018-01-01')
+
+#########################parameter TUNING for the RF model
+# set.seed(53153)
+# caret::createTimeSlices(
+# 1:nrow(train_predictor),
+#   initialWindow = nrow(train_predictor) - nrow(testData),
+#   horizon = leadval,
+#   fixedWindow = TRUE
+# )
+# tr_control <- caret::trainControl(method = 'timeslice', initialWindow = nrow(trainingData) - nrow(testData), fixedWindow = TRUE)
+# 
+# tune_grid <- expand.grid(mtry = c(2,3,4,5,6,(ncol(trainingData) / 3), ceiling(sqrt(ncol(trainingData))), ncol(trainingData)))
+# modellist <- list()
+# for (ntree in c(500,1000,1500)){
+#   set.seed(123)
+#   holdout_result <- caret::train(data.frame(trainingData),as.numeric(train_leads$WGP_ILI_count_lead_1),method = 'rf',trControl = tr_control,tuneGrid = tune_grid,ntree = ntree)
+#   key <- toString(ntree)
+#   modellist[[key]] <- holdout_result
+# }
+
+#results <- resamples(modellist)
+#summary(results)
+#dotplot(results)
+#################################################################
+## optimal value of mtryresulting from the above commands = 6
+#################################################################
+horizon <- 7
+forecasts_rf <- numeric(horizon)
+vnewRF <- list()
+#set.seed(10)
+#set.seed(9)
+#set.seed(8)
+#set.seed(7)
+#set.seed(6)
+#set.seed(5)
+#set.seed(4)
+#set.seed(3)
+ set.seed(2)
+# set.seed(1)
+
+#fit_rf <- randomForest(WGP_ILI_count~.,trainingData,ntree=500,importance=TRUE)
+for (days in 1:horizon){
+  cat("#################Horizon: ",days,"\n")
+  horizon <- as.numeric(str_sub(days,start = -1))
+  ##Reshape training set
+  train_target <- train_leads[,paste0("GP_ILI_count_lead_", horizon)]
+  y_Test <- test_leads[,paste0("GP_ILI_count_lead_", horizon)]
+  if (days == 1) {
+    train_predictor <- trainingData
+    X_test <- testData
+  }else{
+    prev_horizon_realvalues <- train_leads[,paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1),start = -1)))]
+    train_predictor <- merge(train_predictor,prev_horizon_realvalues)
+    fc_xts <- xts(vnewRF[[(days-1)]],order.by=as.Date(time(test_leads)))
+    colnames(fc_xts) <- paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1))))
+    X_test <- merge(X_test,fc_xts)
+    #X_test <- merge(X_test,test_leads[,paste0("GP_ILI_count_lead_",as.numeric(str_sub((days-1),start = -1)))])
+  }
+  forecasts_rf <- numeric(horizon)  
+  ##################################################################
+  #Run a random forest model
+  #fit_rf <- randomForest(train_predictor,train_target,mtry=6,ntree=500,importance=TRUE)
+  fit_rf <- tuneRF(train_predictor,train_target,ntreeTry = 500,plot=TRUE,doBest=TRUE)
+  ##################################################################
+  #Run a regressiong tree
+  #new_train <- cbind(train_target,train_predictor)
+  #formulas <- as.formula(paste(colnames(new_train[,1]),"~",paste(colnames(new_train[,-1]),collapse = "+")))
+  #fit_rf <- rpart(formulas,as.data.frame(new_train))
+  ##################################################################
+  forecasts_rf <- predict(fit_rf, X_test)
+  vnewRF[[days]] <- as.data.frame(forecasts_rf)
+}
+vals <- data.frame(vnewRF)
+names(vals) <- paste0("Pred", 1:days)
+
+# convertback <- data.frame(NULL)
+# for (day in 1:7){
+#   convertback[,day] <- diffinv(vals[,paste0("Pred",day)])
+# }
+# convertback <- diffinv(vals[,"Pred1"])
+# d1 <- as.data.frame(GP_xts[,1])
+# d2<-as.data.frame(test)
+# all.equal(d1,d2)
+
+for (day in 1:7){
+    #evaldf[runrepeat,paste0("rmseDay",day)] <-
+    print(round(rmse(test_leads[122:274,(paste0("GP_ILI_count_lead_",day))],vals[122:274,paste0("Pred",day)]),2))
+  }
+  for (day in 1:7){
+  #evaldf[runrepeat,paste0("maseDay",day)] <-
+    print(round(mae(test_leads[122:274,(paste0("GP_ILI_count_lead_",day))],vals[122:274,paste0("Pred",day)]),2))
+  }
+```
+
+
+```{r Run a classifier chain method on Weather and GP data NO DECOMPOSITION}
+##Run a classifier chain method on Weather and GP data NO DECOMPOSITION
+
+WGP_xts <- xts(WeatherGP[,-1],order.by=WeatherGP$Date.NZST.)
+#impute missing data
+#first impute values of missing data during surveillance season to bethe average of a day before and after the missing value
+WGP_xts<-na_ma(WGP_xts,k=1,weighting='simple')
+#next set all other values outside the surveillance season (i.e. month 0-3 and 9-12) to 0
+WGP_xts[.indexmon(WGP_xts) %in% c(0:3,9:12)] <- 0 
+#############################
+lagval <- 7
+leadval <- 7
+#############################
+WGP <- as.data.table(WGP_xts,keep.rownames = TRUE)
+WTime_leads <- WGP[,shift(.SD,1:leadval,type="lead",give.names = TRUE), .SDcols=c("ILIIncidenceCount")]
+WTime_leads <- cbind(WGP$index,WTime_leads)
+WTime_leads<-na.exclude(WTime_leads)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WTime_leads <- WTime_leads[-(1:lagval),]
+
+#org_cols <- c(colnames(WGP)[-1])
+#lagth <- paste0("lag",1:lagval)
+#lagth <- rep(lagth,each=(ncol(WGP)-1))
+#newcolnames <- paste(c(org_cols),lagth,sep="_")
+WGP_all <- WGP[,shift(.SD,1:lagval,type="lag",give.names = TRUE), .SDcols=2:ncol(WGP)]
+WGP_all <- cbind(WGP,WGP_all)
+##make sure the lead values are adjusted for the reduced size of the lagged dataset
+WGP_all <- WGP_all[-((nrow(WGP_all)-(leadval-1)):nrow(WGP_all)),]
+WGP_all<-na.exclude(WGP_all)
+#######################
+ndays <- 7
+#######################
+#create a vector of names for x days into the future
+namevect <- NULL
+
+#ndays_to_namevect <- function(ndays){
+for (nd in 1:ndays){
+  newcol <- paste('ili.plus',nd)
+  newcol <- str_replace_all(string=newcol, pattern=" ", repl="")
+  print (newcol)
+  namevect <- c(namevect,newcol)
+}
+
+WGP_xts <- xts(WGP_all[,-1],order.by = WGP_all$index)
+#WtrainingDataCC <- window(WGP_xts,end='2018-04-30')
+WtrainingDataCC <- window(WGP_xts,end='2017-12-31')
+#Wtrain_targetCC <- Wtrain_leads$ILIIncidenceCount_lead_1
+Wtrain_predictorCC <- WtrainingDataCC[, -1]
+
+WGP_all_leads <- xts(WTime_leads[,-1],order.by = WTime_leads$V1)
+#Wtrain_leads <- window(WGP_all_leads,end='2018-04-30')
+Wtrain_leads <- window(as.xts(WGP_all_leads),end='2017-12-31')
+
+# WtestDataCC <- window(WGP_xts,start='2018-05-01',end='2018-09-30') 
+# Wtest_leads <- window(WGP_all_leads,start='2018-05-01',end='2018-09-30')
+WtestDataCC <- window(WGP_xts,start='2018-01-01') 
+Wtest_leads <- window(WGP_all_leads,start='2018-01-01')
+
+# #parameter TUNING for the RF model
+# caret::createTimeSlices(
+#   1:nrow(Wtrain_predictorCC),
+#   initialWindow = nrow(Wtrain_predictorCC) - nrow(WtestDataCC),
+#   horizon = leadval,
+#   fixedWindow = TRUE
+# )
+# tr_control <- caret::trainControl(
+#   method = 'timeslice',
+#   initialWindow = nrow(WtrainingDataCC) - nrow(WtestDataCC),
+#   fixedWindow = TRUE
+# )
+# tune_grid <- expand.grid(
+#   mtry = c(2,3,4,5,6,ncol(WtrainingDataCC) / 3,
+#     ceiling(sqrt(ncol(WtrainingDataCC))),
+#     ncol(WtrainingDataCC)
+#   )
+# )
+#     holdout_result <- caret::train(
+#     data.frame(Wtrain_predictorCC),
+#     Wtrain_targetCC,
+#     method = 'rf',
+#     trControl = tr_control,
+#     tuneGrid = tune_grid
+#     )
+
+#set.seed(1)
+#set.seed(2)
+#set.seed(3)
+#set.seed(4)
+#set.seed(5)
+#set.seed(6)
+ #set.seed(7)
+#set.seed(8)
+ set.seed(9)
+# set.seed(10)
+#run a classifier chain
+##########################
+Wnrepeats <- 10
+##########################
+Wrememberorder <- NULL
+WPreddf_list <- list()
+W_new <- list() 
+for (repeats in 1:Wnrepeats){
+  #set.seed(50)
+  cat("##################Repeat number",repeats,"\n")
+  Wnumberofdays <- sample(namevect)
+  cat("#################The order of predictions: ",Wnumberofdays,"\n")
+  Wrememberorder[repeats] <- list(Wnumberofdays)
+  for (Wdays in 1:length(Wnumberofdays)){
+    cat("#################Horizon: ",Wnumberofdays[Wdays],"\n")
+    WhorizonCC <- as.numeric(str_sub(Wnumberofdays[Wdays],start = -1))
+    ##Reshape training set
+    Wtrain_targetCC <- Wtrain_leads[,paste("ILIIncidenceCount_lead", WhorizonCC,sep="_")]
+    Wy_testCC <- Wtest_leads[,paste("ILIIncidenceCount_lead", WhorizonCC,sep="_")]
+    if (Wdays == 1) {
+      Wtrain_predictorCC <- WtrainingDataCC
+      WX_testCC <- WtestDataCC
+    }else{
+      Wprev_horizon_realvalues <- Wtrain_leads[,paste0("ILIIncidenceCount_lead_",as.numeric(str_sub(Wnumberofdays[Wdays-1],start = -1)))]
+      Wtrain_predictorCC <- merge(Wtrain_predictorCC,Wtrain_leads[,paste0("ILIIncidenceCount_lead_",as.numeric(str_sub(Wnumberofdays[Wdays-1],start = -1)))])
+      ###Add Forecasted values as a column in the predictors of the test set
+      Wforecasted_day <- as.numeric(str_sub(Wnumberofdays[Wdays-1],start = -1))
+      Wfc_xtsCC <- xts(W_new[[(Wforecasted_day)]],order.by = as.Date(time(Wtest_leads)))
+      colnames(Wfc_xtsCC) <- paste0("ILIIncidenceCount_lead_",as.numeric(str_sub((Wforecasted_day))))
+      WX_testCC <- merge(WX_testCC,Wfc_xtsCC)
+      #WX_testCC <- merge(WX_testCC,Wtest_leads[,paste0("ILI.GP._lead_",as.numeric(str_sub(Wnumberofdays[Wdays-1],start = -1)))])
+    }
+    Wforecasts_rfCC <- numeric(ndays)
+    Wfit_rfCC <- tuneRF(Wtrain_predictorCC,Wtrain_targetCC,ntreeTry = 500,doBest=TRUE)
+    #Wfit_rfCC <- randomForest(data.frame(Wtrain_predictorCC),Wtrain_targetCC,ntree=500,mtry=16,importance=TRUE)
+      #for (i in 1:horizonCC){
+      # predict using the test set
+    Wforecasts_rfCC <- predict(Wfit_rfCC, WX_testCC)
+    #column_to_add <- paste0("PredDay",horizonCC,sep="_")
+    W_new[[WhorizonCC]] <- as.vector(Wforecasts_rfCC)
+  }
+  Wvals <- data.frame(W_new)
+  names(Wvals) <- paste0("Pred", 1:Wdays)
+  WPreddf_list [[repeats]] <- Wvals
+}
+                                        
+Wall <- data.frame(WPreddf_list)
+Wmedians <- list()
+#day_median <- as.data.frame(NULL)
+for (n in 1:ndays){
+  d <-paste0("Pred",n)
+  Wmedians[[n]] <- apply(Wall[,grepl(d,colnames(Wall))],1,median)
+}
+
+WGPmedian_of_pred <- data.frame(Wmedians)
+names(WGPmedian_of_pred) <- paste0("Pred", 1:ndays)
+
+for (n in 1:ndays){
+  print(round(rmse(Wtest_leads[121:275,paste0('ILIIncidenceCount_lead_',n)],WGPmedian_of_pred[121:275,paste0('Pred',n)]),2))
+}
+for (n in 1:ndays){
+  print(round(mae(Wtest_leads[121:275,paste0('ILIIncidenceCount_lead_',n)],WGPmedian_of_pred[121:275,paste0('Pred',n)]),2))
+}
+```
+Run Prophet in R
+
+
+
